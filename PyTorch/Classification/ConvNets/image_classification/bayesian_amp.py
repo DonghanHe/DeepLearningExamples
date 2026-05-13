@@ -3,10 +3,12 @@ import torch.nn as nn
 from typing import Dict, Optional
 
 # FP8 is excluded: standard ATen mm/conv ops require torch._scaled_mm for FP8 inputs.
-# Thresholds are ordered lowest-to-highest; the first match wins.
+# Thresholds map log2(SNR) → the dtype that can represent that SNR level.
+# Ordered lowest-to-highest; the first match wins.
 _SNR_THRESHOLDS = [
     (17.58, torch.bfloat16),
     (23.58, torch.float16),
+    # > 23.58 → torch.float32 (default)
 ]
 
 
@@ -14,13 +16,15 @@ class BayesianAMPHook:
     """
     Per-module precision router based on the Vadam posterior SNR.
 
-    Attaches pre- and post-forward hooks to a single nn.Linear or nn.Conv2d.
-    The pre-hook opens a nested torch.autocast context at the dynamically
-    chosen dtype; the post-hook closes it and upcasts the output back to FP32
-    to protect the residual backbone.
+    Design: Bayesian AMP runs *inside* a global torch.autocast(dtype=base_dtype)
+    context (typically BF16 on A100). Hooks are no-ops for layers whose SNR
+    falls within base_dtype's capacity — zero overhead for the common case.
+    They only intervene to *upgrade* high-SNR layers to FP32, exiting the global
+    autocast for those layers and casting their output back to base_dtype before
+    re-entering the global stream.
 
-    Call update_dtype() once per optimizer.step() to refresh the precision
-    decision from the bias-corrected AdamW second moment.
+    This avoids the BF16→FP32→BF16 ping-pong that happens when every layer
+    triggers a context switch regardless of whether it needs one.
     """
 
     def __init__(
@@ -30,12 +34,14 @@ class BayesianAMPHook:
         optimizer: torch.optim.Optimizer,
         N: int,
         beta2: float = 0.999,
+        base_dtype: torch.dtype = torch.bfloat16,
     ):
         self.param = param
         self.opt = optimizer
         self.N = N
         self.beta2 = beta2
-        self._dtype = torch.float32
+        self.base_dtype = base_dtype  # matches the outer torch.autocast dtype
+        self._dtype = base_dtype      # start in base_dtype (no-op initially)
         self._step = 0
         self._ctx: Optional[torch.autocast] = None
         self._pre = module.register_forward_pre_hook(self._pre_hook)
@@ -51,8 +57,8 @@ class BayesianAMPHook:
             return
 
         self._step += 1
-        # Bias correction: v_t is initialized to 0, so early steps are downward-biased.
-        # Without this, SNR is artificially high early in training, causing premature downcast.
+        # Bias correction: v_t is initialized to 0, making early SNR estimates too high
+        # without this correction, which would cause premature precision decisions.
         bias_corr = 1.0 - self.beta2 ** self._step
         v_hat = v_t / bias_corr
 
@@ -63,29 +69,41 @@ class BayesianAMPHook:
                 break
 
         with torch.no_grad():
-            # SNR per element; use 10th-percentile as the weakest-link proxy
-            # (consistent with §2 of the Bayesian AMP derivation).
+            # 10th-percentile SNR: weakest-link proxy consistent with §2 of the derivation.
             snr = torch.abs(self.param) * torch.sqrt(self.N * v_hat + max(wd, 1e-8))
             log2_snr = torch.log2(torch.quantile(snr.float(), 0.10) + 1e-8).item()
 
-        self._dtype = torch.float32
+        # Default: same as base_dtype (hook is a no-op → zero overhead)
+        self._dtype = self.base_dtype
         for threshold, dtype in _SNR_THRESHOLDS:
             if log2_snr <= threshold:
                 self._dtype = dtype
                 break
+        # If log2_snr > 23.58, SNR exceeds FP16 capacity → need FP32
+        # (no threshold match above means _dtype stays at base_dtype unless we set FP32)
+        if log2_snr > 23.58:
+            self._dtype = torch.float32
 
     def _pre_hook(self, module, args):
-        if self._dtype != torch.float32:
+        # No-op when this layer's dtype matches the global autocast dtype.
+        # Only activate when we need to deviate (upgrade to FP32).
+        if self._dtype != self.base_dtype:
             device_type = "cuda" if self.param.is_cuda else "cpu"
-            self._ctx = torch.autocast(device_type=device_type, dtype=self._dtype)
+            if self._dtype == torch.float32:
+                # Exit the global BF16 autocast for this layer
+                self._ctx = torch.amp.autocast(device_type=device_type, enabled=False)
+            else:
+                self._ctx = torch.amp.autocast(device_type=device_type, dtype=self._dtype)
             self._ctx.__enter__()
 
     def _post_hook(self, module, args, output):
         if self._ctx is not None:
             self._ctx.__exit__(None, None, None)
             self._ctx = None
-            if isinstance(output, torch.Tensor) and output.dtype != torch.float32:
-                return output.to(torch.float32)
+            # Cast back to base_dtype to re-enter the global autocast stream.
+            # Only needed when we deviated (FP32 layer inside a BF16 global context).
+            if isinstance(output, torch.Tensor) and output.dtype != self.base_dtype:
+                return output.to(self.base_dtype)
 
     def remove(self):
         self._pre.remove()
@@ -97,15 +115,27 @@ class BayesianAMPManager:
     Attaches a BayesianAMPHook to every nn.Linear and nn.Conv2d whose weight
     is tracked by the given optimizer. Handles DDP-wrapped models transparently.
 
+    Must be used inside a global torch.amp.autocast(dtype=base_dtype) context.
+    Hooks are no-ops for layers whose SNR fits within base_dtype; they only
+    intervene to upgrade high-SNR layers to FP32.
+
     Usage:
         mgr = BayesianAMPManager(model, optimizer, N=len(dataset))
-        # inside train loop, after optimizer.step():
-        mgr.step()
-        # at end of training:
-        mgr.remove()
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            loss = criterion(model(x), y)
+        loss.backward()
+        optimizer.step()
+        mgr.step()   # refresh precision decisions
     """
 
-    def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, N: int):
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        N: int,
+        base_dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.base_dtype = base_dtype
         inner = getattr(model, "module", model)  # unwrap DistributedDataParallel
         param_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
         self._hooks: Dict[str, BayesianAMPHook] = {}
@@ -113,7 +143,9 @@ class BayesianAMPManager:
             if not isinstance(mod, (nn.Linear, nn.Conv2d)):
                 continue
             if id(mod.weight) in param_ids:
-                self._hooks[name] = BayesianAMPHook(mod, mod.weight, optimizer, N)
+                self._hooks[name] = BayesianAMPHook(
+                    mod, mod.weight, optimizer, N, base_dtype=base_dtype
+                )
 
     def step(self):
         """Update per-layer precision decisions. Call once per optimizer.step()."""
