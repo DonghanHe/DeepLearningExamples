@@ -66,6 +66,7 @@ from image_classification.optimizers import (
     lr_linear_policy,
     lr_step_policy,
 )
+from image_classification.bayesian_amp import BayesianAMPManager
 from image_classification.gpu_affinity import set_affinity, AffinityMode
 import dllogger
 
@@ -206,7 +207,7 @@ def add_parser_arguments(parser, skip_arch=False):
         "--mixup", default=0.0, type=float, metavar="ALPHA", help="mixup alpha"
     )
     parser.add_argument(
-        "--optimizer", default="sgd", type=str, choices=("sgd", "rmsprop")
+        "--optimizer", default="sgd", type=str, choices=("sgd", "rmsprop", "adamw")
     )
 
     parser.add_argument(
@@ -272,6 +273,11 @@ def add_parser_arguments(parser, skip_arch=False):
         "--amp",
         action="store_true",
         help="Run model AMP (automatic mixed precision) mode.",
+    )
+    parser.add_argument(
+        "--bayesian-amp",
+        action="store_true",
+        help="Enable Bayesian AMP: per-layer precision routing via Vadam SNR from AdamW state. Requires --optimizer adamw.",
     )
 
     parser.add_argument(
@@ -586,11 +592,29 @@ def prepare_for_training(args, model_args, model_arch):
     if model_state is not None:
         executor.model.load_state_dict(model_state)
 
+    bayesian_amp_mgr = None
+    if getattr(args, "bayesian_amp", False):
+        if args.optimizer != "adamw":
+            print(
+                "Warning: --bayesian-amp requires --optimizer adamw; "
+                "Bayesian AMP disabled."
+            )
+        else:
+            N_dataset = train_loader_len * args.batch_size * args.world_size
+            bayesian_amp_mgr = BayesianAMPManager(
+                executor.model, optimizer, N=N_dataset
+            )
+            print(
+                f"Bayesian AMP enabled: {len(bayesian_amp_mgr._hooks)} layers tracked, "
+                f"N_dataset={N_dataset}"
+            )
+
     trainer = Trainer(
         executor,
         optimizer,
         grad_acc_steps=batch_size_multiplier,
         ema=args.use_ema,
+        bayesian_amp_mgr=bayesian_amp_mgr,
     )
 
     if (args.use_ema is not None) and (model_state_ema is not None):

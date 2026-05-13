@@ -25,6 +25,13 @@ def get_optimizer(parameters, lr, args, state=None):
             eps=args.rmsprop_eps,
             bn_weight_decay=args.bn_weight_decay,
         )
+    elif args.optimizer == "adamw":
+        optimizer = get_adamw_optimizer(
+            parameters,
+            lr,
+            weight_decay=args.weight_decay,
+            bn_weight_decay=args.bn_weight_decay,
+        )
     if not state is None:
         optimizer.load_state_dict(state)
 
@@ -54,6 +61,20 @@ def get_sgd_optimizer(
     )
 
     return optimizer
+
+
+def get_adamw_optimizer(parameters, lr, weight_decay, bn_weight_decay=False):
+    if bn_weight_decay:
+        params = [v for n, v in parameters]
+    else:
+        bn_params = [v for n, v in parameters if "bn" in n]
+        rest_params = [v for n, v in parameters if "bn" not in n]
+        params = [
+            {"params": bn_params, "weight_decay": 0},
+            {"params": rest_params, "weight_decay": weight_decay},
+        ]
+
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
 
 def get_rmsprop_optimizer(

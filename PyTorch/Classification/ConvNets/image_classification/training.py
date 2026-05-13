@@ -30,7 +30,10 @@
 import time
 from copy import deepcopy
 from functools import wraps
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .bayesian_amp import BayesianAMPManager
 
 import torch
 import torch.nn as nn
@@ -141,10 +144,12 @@ class Trainer:
         optimizer: torch.optim.Optimizer,
         grad_acc_steps: int,
         ema: Optional[float] = None,
+        bayesian_amp_mgr: Optional["BayesianAMPManager"] = None,
     ):
         self.executor = executor
         self.optimizer = optimizer
         self.grad_acc_steps = grad_acc_steps
+        self.bayesian_amp_mgr = bayesian_amp_mgr
         self.use_ema = False
         if ema is not None:
             self.ema_executor = deepcopy(self.executor)
@@ -175,6 +180,8 @@ class Trainer:
                 self.executor.scaler.update()
             else:
                 self.optimizer.step()
+            if self.bayesian_amp_mgr is not None:
+                self.bayesian_amp_mgr.step()
             self.optimizer.zero_grad()
             self.steps_since_update = 0
 
