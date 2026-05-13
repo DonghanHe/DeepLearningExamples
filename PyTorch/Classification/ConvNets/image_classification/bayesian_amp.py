@@ -44,6 +44,13 @@ class BayesianAMPHook:
         self._dtype = base_dtype
         self._step = 0
         self._ctx: Optional[torch.autocast] = None
+        # Cache weight_decay once — avoids scanning all param_groups every step
+        self._wd: float = next(
+            (g.get("weight_decay", 0.0) for g in optimizer.param_groups
+             if any(p is param for p in g["params"])), 0.0
+        )
+        # p10 index for kthvalue — computed once from param shape
+        self._p10_k = max(1, int(0.10 * param.numel()))
         # Start with no hooks registered — attached dynamically when needed
         self._pre: Optional[torch.utils.hooks.RemovableHook] = None
         self._post: Optional[torch.utils.hooks.RemovableHook] = None
@@ -69,21 +76,16 @@ class BayesianAMPHook:
             return
 
         self._step += 1
-        # Bias correction: v_t initialized at 0 makes early SNR artificially high
-        # without this, causing premature precision decisions.
         bias_corr = 1.0 - self.beta2 ** self._step
         v_hat = v_t / bias_corr
 
-        wd = 0.0
-        for g in self.opt.param_groups:
-            if any(p is self.param for p in g["params"]):
-                wd = g.get("weight_decay", 0.0)
-                break
-
         with torch.no_grad():
-            # 10th-percentile SNR: weakest-link proxy consistent with §2.
-            snr = torch.abs(self.param) * torch.sqrt(self.N * v_hat + max(wd, 1e-8))
-            log2_snr = torch.log2(torch.quantile(snr.float(), 0.10) + 1e-8).item()
+            # kthvalue is O(n) selection — no full sort, no GPU→CPU sync until .item()
+            # at the end. weight_decay cached at init to avoid param_group scan.
+            snr = torch.abs(self.param) * torch.sqrt(self.N * v_hat + max(self._wd, 1e-8))
+            log2_snr = torch.log2(
+                snr.view(-1).kthvalue(self._p10_k).values + 1e-8
+            ).item()
 
         new_dtype = self.base_dtype
         for threshold, dtype in _SNR_THRESHOLDS:
@@ -94,7 +96,6 @@ class BayesianAMPHook:
             new_dtype = torch.float32
 
         self._dtype = new_dtype
-        # Hooks are only needed when this layer deviates from the global base dtype
         self._set_hooks(new_dtype != self.base_dtype)
 
     def _pre_hook(self, module, args):
@@ -140,8 +141,11 @@ class BayesianAMPManager:
         optimizer: torch.optim.Optimizer,
         N: int,
         base_dtype: torch.dtype = torch.bfloat16,
+        update_interval: int = 50,
     ):
         self.base_dtype = base_dtype
+        self.update_interval = update_interval
+        self._call_count = 0
         inner = getattr(model, "module", model)  # unwrap DistributedDataParallel
         param_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
         self._hooks: Dict[str, BayesianAMPHook] = {}
@@ -154,9 +158,15 @@ class BayesianAMPManager:
                 )
 
     def step(self):
-        """Update per-layer precision decisions. Call once per optimizer.step()."""
-        for h in self._hooks.values():
-            h.update_dtype()
+        """Update per-layer precision decisions every update_interval optimizer steps.
+
+        SNR changes slowly — updating every step wastes 54 GPU→CPU syncs/step.
+        Default interval=50 means one update per ~50 optimizer steps.
+        """
+        self._call_count += 1
+        if self._call_count % self.update_interval == 0:
+            for h in self._hooks.values():
+                h.update_dtype()
 
     def dtype_summary(self) -> Dict[str, str]:
         """Return {layer_name: dtype_str} for inspection/logging."""
