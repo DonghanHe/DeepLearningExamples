@@ -17,14 +17,13 @@ class BayesianAMPHook:
     Per-module precision router based on the Vadam posterior SNR.
 
     Design: Bayesian AMP runs *inside* a global torch.autocast(dtype=base_dtype)
-    context (typically BF16 on A100). Hooks are no-ops for layers whose SNR
-    falls within base_dtype's capacity — zero overhead for the common case.
-    They only intervene to *upgrade* high-SNR layers to FP32, exiting the global
-    autocast for those layers and casting their output back to base_dtype before
-    re-entering the global stream.
+    context (typically BF16 on A100). For layers whose SNR fits within
+    base_dtype's capacity, NO hooks are registered — zero Python call overhead.
+    Hooks are only dynamically attached when update_dtype() determines a layer
+    needs to deviate (upgrade to FP32), and detached again if it later drops back.
 
-    This avoids the BF16→FP32→BF16 ping-pong that happens when every layer
-    triggers a context switch regardless of whether it needs one.
+    This means the common case (all layers BF16 early in training) has identical
+    overhead to standard torch.autocast, since there are no hooks at all.
     """
 
     def __init__(
@@ -36,16 +35,29 @@ class BayesianAMPHook:
         beta2: float = 0.999,
         base_dtype: torch.dtype = torch.bfloat16,
     ):
+        self.module = module
         self.param = param
         self.opt = optimizer
         self.N = N
         self.beta2 = beta2
-        self.base_dtype = base_dtype  # matches the outer torch.autocast dtype
-        self._dtype = base_dtype      # start in base_dtype (no-op initially)
+        self.base_dtype = base_dtype
+        self._dtype = base_dtype
         self._step = 0
         self._ctx: Optional[torch.autocast] = None
-        self._pre = module.register_forward_pre_hook(self._pre_hook)
-        self._post = module.register_forward_hook(self._post_hook)
+        # Start with no hooks registered — attached dynamically when needed
+        self._pre: Optional[torch.utils.hooks.RemovableHook] = None
+        self._post: Optional[torch.utils.hooks.RemovableHook] = None
+
+    def _set_hooks(self, active: bool) -> None:
+        """Register hooks when a layer deviates from base_dtype; remove when it returns."""
+        if active and self._pre is None:
+            self._pre = self.module.register_forward_pre_hook(self._pre_hook)
+            self._post = self.module.register_forward_hook(self._post_hook)
+        elif not active and self._pre is not None:
+            self._pre.remove()
+            self._post.remove()
+            self._pre = None
+            self._post = None
 
     def update_dtype(self):
         """Recompute target dtype from current optimizer state. Call after opt.step()."""
@@ -57,8 +69,8 @@ class BayesianAMPHook:
             return
 
         self._step += 1
-        # Bias correction: v_t is initialized to 0, making early SNR estimates too high
-        # without this correction, which would cause premature precision decisions.
+        # Bias correction: v_t initialized at 0 makes early SNR artificially high
+        # without this, causing premature precision decisions.
         bias_corr = 1.0 - self.beta2 ** self._step
         v_hat = v_t / bias_corr
 
@@ -69,45 +81,39 @@ class BayesianAMPHook:
                 break
 
         with torch.no_grad():
-            # 10th-percentile SNR: weakest-link proxy consistent with §2 of the derivation.
+            # 10th-percentile SNR: weakest-link proxy consistent with §2.
             snr = torch.abs(self.param) * torch.sqrt(self.N * v_hat + max(wd, 1e-8))
             log2_snr = torch.log2(torch.quantile(snr.float(), 0.10) + 1e-8).item()
 
-        # Default: same as base_dtype (hook is a no-op → zero overhead)
-        self._dtype = self.base_dtype
+        new_dtype = self.base_dtype
         for threshold, dtype in _SNR_THRESHOLDS:
             if log2_snr <= threshold:
-                self._dtype = dtype
+                new_dtype = dtype
                 break
-        # If log2_snr > 23.58, SNR exceeds FP16 capacity → need FP32
-        # (no threshold match above means _dtype stays at base_dtype unless we set FP32)
         if log2_snr > 23.58:
-            self._dtype = torch.float32
+            new_dtype = torch.float32
+
+        self._dtype = new_dtype
+        # Hooks are only needed when this layer deviates from the global base dtype
+        self._set_hooks(new_dtype != self.base_dtype)
 
     def _pre_hook(self, module, args):
-        # No-op when this layer's dtype matches the global autocast dtype.
-        # Only activate when we need to deviate (upgrade to FP32).
-        if self._dtype != self.base_dtype:
-            device_type = "cuda" if self.param.is_cuda else "cpu"
-            if self._dtype == torch.float32:
-                # Exit the global BF16 autocast for this layer
-                self._ctx = torch.amp.autocast(device_type=device_type, enabled=False)
-            else:
-                self._ctx = torch.amp.autocast(device_type=device_type, dtype=self._dtype)
-            self._ctx.__enter__()
+        device_type = "cuda" if self.param.is_cuda else "cpu"
+        if self._dtype == torch.float32:
+            self._ctx = torch.amp.autocast(device_type=device_type, enabled=False)
+        else:
+            self._ctx = torch.amp.autocast(device_type=device_type, dtype=self._dtype)
+        self._ctx.__enter__()
 
     def _post_hook(self, module, args, output):
         if self._ctx is not None:
             self._ctx.__exit__(None, None, None)
             self._ctx = None
-            # Cast back to base_dtype to re-enter the global autocast stream.
-            # Only needed when we deviated (FP32 layer inside a BF16 global context).
             if isinstance(output, torch.Tensor) and output.dtype != self.base_dtype:
                 return output.to(self.base_dtype)
 
     def remove(self):
-        self._pre.remove()
-        self._post.remove()
+        self._set_hooks(False)
 
 
 class BayesianAMPManager:
